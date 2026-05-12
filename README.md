@@ -44,9 +44,11 @@ This project implements a **federated learning (FL) system** for wearable-sensor
 | 5 | Climbing stairs | 11 | Running |
 | 6 | Waist bends forward | 12 | Jump front & back |
 
-**10 subjects** participate in the federation: subjects 1–8 train on **8 Raspberry Pi 4 edge devices** (one subject per device), while subjects 9–10 form a held-out test set evaluated only by the central server. A central server aggregates the models each round, evaluates the global model on the held-out test, and writes an immutable summary to the blockchain.
+**10 subjects** participate in the federation on **10 Raspberry Pi 4 edge devices** (one subject per device). A central server aggregates the models each round, performs global evaluation, and writes an immutable summary to the blockchain.
 
-**Training setup:** 10 FL rounds, 8 clients (one per training subject), 1 local epoch per round, `AdamW` lr=0.002. Results are recorded to `outputs/results.json` after each run.
+**Training setup:** 10 FL rounds, 10 clients (full participation each round), 1 local epoch per round, `AdamW` lr=0.002.
+
+**Reality check (production-only):** all experiments in this repository use real hardware (RP4), real MHEALTH data, real IPFS pinning, and real Base mainnet transactions.
 
 ---
 
@@ -62,7 +64,7 @@ flowchart TD
             C0["Client 0 (Train)"]
             C1["Client 1 (Train)"]
             CX["..."]
-            C9["Client 9 (Eval)"]
+            C9["Client 9 (Train)"]
         end
 
         SERVER <==>|"Weights & Updates"| CLIENTS
@@ -173,10 +175,9 @@ Output: (B, 12) raw logits — 12-class softmax classification
 The **MHEALTH dataset** (Banos et al., 2015) contains sensor recordings from 10 healthy subjects performing 12 physical activities. Each subject wears three inertial measurement units (IMU) on the chest, right wrist, and left ankle, providing 23 channels at 50 Hz.
 
 **Subject-based partitioning:**
-- **Subjects 1–8** → training federation (one per Raspberry Pi 4 device)
-- **Subjects 9–10** → held-out test set (514 windows, evaluated by server only)
+- **Subjects 1–10** → training federation (one per Raspberry Pi 4 device)
 
-**Windowing:** each subject's time-series is segmented into **256-sample non-overlapping windows** (5.12 seconds at 50 Hz) with 50% stride during loading. Total: 2,065 training windows, 514 test windows.
+**Windowing:** each subject's time-series is segmented into **256-sample non-overlapping windows** (5.12 seconds at 50 Hz) with 50% stride during loading.
 
 **Normalisation:** per-channel z-score using training statistics computed independently on each subject's data (no data leakage across partitions).
 
@@ -189,7 +190,7 @@ Each round:
 1. **Server** broadcasts the current global model weights to all selected clients.
 2. **Each client** receives the weights, fine-tunes for `local-epochs` using its local shard, and returns the updated weights + scalar metrics (loss, samples, training time, active classes).
 3. **Server** aggregates via `MedicalFedAvg` — a `FedAvg` variant that forces equal contribution weight (`weight=1`) for every client regardless of shard size, preventing large-shard clients from dominating.
-4. **Global evaluation** is performed on the held-out test set (partition 0 used as proxy for the full test set).
+4. **Global evaluation** is performed on the server-side evaluation partition configured for the active run.
 5. **Blockchain** records three block types for the round (see below).
 
 ### Blockchain Ledger
@@ -277,7 +278,7 @@ The project includes a **real-time dashboard** (`fl_blockchain_evm/dashboard/fl_
 | **Metrics History Chart** | Hand-drawn line chart of accuracy, F1, AUC over rounds |
 | **Per-Activity F1** | Bar breakdown for all 12 MHEALTH activities |
 | **Confusion Matrix** | 5×5 heatmap with intensity shading |
-| **Blockchain Ledger** | Live connection to Base main — shows recent blocks (LOCAL/VOTE/GLOBAL), chain validity badge, expandable full history |
+| **Blockchain Ledger** | Live connection to Base mainnet — shows recent blocks (LOCAL/VOTE/GLOBAL), chain validity badge, expandable full history |
 | **IPFS Off-Chain Storage** | Active/disabled status, total pin count, per-round CID list with clickable Pinata gateway links |
 
 **Interactive controls:**
@@ -301,7 +302,7 @@ This system is grounded in three converging research threads:
 **Key differentiators from prior work:**
 - Real production L2 deployment (not testnet or simulation)
 - Quantified per-round blockchain middleware overhead with baseline vs. optimised comparison
-- Hardware FL on Raspberry Pi 4 devices (subjects 1–8), not simulated edge nodes
+- Hardware FL on 10 Raspberry Pi 4 devices (subjects 1–10), not simulated edge nodes
 - 12-class HAR (MHEALTH) with per-activity AUC reaching 99.9%
 
 ---
@@ -430,18 +431,18 @@ All FL hyperparameters live in `pyproject.toml`:
 ```toml
 [tool.flwr.app.config]
 num-server-rounds = 10
-fraction-train    = 1.0      # all 8 training clients selected each round
+fraction-train    = 1.0      # all 10 training clients selected each round
 local-epochs      = 1
 lr                = 0.002
 batch-size        = 256
 ```
 
-The federation runs with **8 virtual SuperNodes** (one per MHEALTH training subject):
+The federation runs with **10 SuperNodes** (one per MHEALTH subject/device):
 
 ```toml
 # local simulation example
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 8
+options.num-supernodes = 10
 options.backend.client_resources.num_cpus = 1
 options.backend.client_resources.num_gpus = 0
 ```
@@ -460,7 +461,7 @@ All commands assume you are in the project root with the virtual environment act
 flwr run .
 ```
 
-This launches a local simulation with 8 virtual clients (one per training subject). The blockchain writes are real — each round will send transactions to Base mainnet, so ensure your wallet has sufficient ETH (roughly 0.001 ETH per round).
+This launches a local simulation with 10 virtual clients (one per training subject/device). The blockchain writes are real — each round sends transactions to Base mainnet, so ensure your wallet has sufficient ETH (roughly 0.001 ETH per round).
 
 **What happens during training:**
 - Each round writes exactly **3 transactions** to Base main:
@@ -531,6 +532,12 @@ outputs/
 
 final_model.pt            # PyTorch state dict of the final global model
 ```
+
+For the published real-data experiments, this repository already includes full run archives under `outputs/`:
+
+- `baseline_*` directories: 10 full cycles, each cycle = 10 FL rounds
+- `optimized_*` directories: 10 full cycles, each cycle = 10 FL rounds
+- each run folder includes `experiment_config.json` and `results.json`
 
 When IPFS is enabled, each `"global"` record in `results.json` includes an `ipfs_cids` field:
 
