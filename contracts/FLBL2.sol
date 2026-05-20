@@ -6,10 +6,10 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contr
 import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v5.0.2/contracts/utils/Pausable.sol";
 
 /**
- * @title   FLBlockchain
+ * @title   FLBL2s
  * @notice  Immutable audit ledger for federated learning rounds on Base mainnet (EVM L2).
  */
-contract FLBlockchain is Ownable, Pausable {
+contract FLBL2 is Ownable, Pausable {
 
     error NotAuthorized(address caller);
     error ClientsCanOnlyAddLocalBlocks(string attempted);
