@@ -46,7 +46,7 @@ This project implements a **federated learning (FL) system** for wearable-sensor
 
 **10 subjects** participate in the federation on **10 Raspberry Pi 4 edge devices** (one subject per device). A central server aggregates the models each round, performs global evaluation, and writes an immutable summary to the blockchain.
 
-**Training setup:** 10 FL rounds, 10 clients (full participation each round), 1 local epoch per round, `AdamW` lr=0.002.
+**Training setup:** 10 FL rounds per session × 20 sessions (200 rounds total), 10 clients (full participation each round), 5 local epochs per round, `AdamW` lr=0.002, batch size 64.
 
 **Reality check (production-only):** all experiments in this repository use real hardware (RP4), real MHEALTH data, real IPFS pinning, and real Base mainnet transactions.
 
@@ -175,9 +175,10 @@ Output: (B, 12) raw logits — 12-class softmax classification
 The **MHEALTH dataset** (Banos et al., 2015) contains sensor recordings from 10 healthy subjects performing 12 physical activities. Each subject wears three inertial measurement units (IMU) on the chest, right wrist, and left ankle, providing 23 channels at 50 Hz.
 
 **Subject-based partitioning:**
-- **Subjects 1–10** → training federation (one per Raspberry Pi 4 device)
+- **Subjects 1–8** → training federation (distributed across 10 Raspberry Pi 4 devices, with some subjects shared)
+- **Subjects 9–10** → fixed held-out test set (514 windows, evaluated after each aggregation round)
 
-**Windowing:** each subject's time-series is segmented into **256-sample non-overlapping windows** (5.12 seconds at 50 Hz) with 50% stride during loading.
+**Windowing:** each subject's time-series is segmented into **256-sample windows** (~5.12 seconds at 50 Hz) with **50% overlap**.
 
 **Normalisation:** per-channel z-score using training statistics computed independently on each subject's data (no data leakage across partitions).
 
@@ -302,7 +303,7 @@ This system is grounded in three converging research threads:
 **Key differentiators from prior work:**
 - Real production L2 deployment (not testnet or simulation)
 - Quantified per-round blockchain middleware overhead with baseline vs. optimised comparison
-- Hardware FL on 10 Raspberry Pi 4 devices (subjects 1–10), not simulated edge nodes
+- Hardware FL on 10 Raspberry Pi 4 devices (subjects 1–8 for training, 9–10 held-out), not simulated edge nodes
 - 12-class HAR (MHEALTH) with per-activity AUC reaching 99.9%
 
 ---
@@ -432,9 +433,10 @@ All FL hyperparameters live in `pyproject.toml`:
 [tool.flwr.app.config]
 num-server-rounds = 10
 fraction-train    = 1.0      # all 10 training clients selected each round
-local-epochs      = 1
+local-epochs      = 5
 lr                = 0.002
-batch-size        = 256
+batch-size        = 64
+num-partitions    = 8
 ```
 
 The federation runs with **10 SuperNodes** (one per MHEALTH subject/device):
