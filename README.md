@@ -1,4 +1,4 @@
-# Blockchain-Based Federated Learning for Human Activity Recognition
+# FLBL2: Real-World Layer-2 Blockchain Auditing for Federated Learning on Edge Hardware
 
 > Federated learning over the **MHEALTH** dataset, deployed across Raspberry Pi 4 edge devices, with a Base mainnet (Ethereum L2) smart-contract ledger for tamper-proof audit of every training round.
 
