@@ -101,7 +101,7 @@ fl_blockchain_evm/
 ├── utils.py                 # Shared utilities
 │
 ├── core/
-│   ├── model.py             # SE-ResNet definition (920K params, 23-ch input, 12 classes)
+│   ├── model.py             # SE-ResNet definition (~860K trainable params, 23-ch input, 12 classes)
 │   ├── data.py              # MHEALTH loader, windowing, subject partitioning
 │   ├── training.py          # train() / evaluate() functions
 │   └── constants.py         # Activity labels, dataset constants
@@ -124,16 +124,17 @@ fl_blockchain_evm/
     └── store.py             # Persistent state store
 
 contracts/
-├── FLBlockchain.sol         # Solidity smart contract (deployed via Remix IDE)
-└── FLBlockchain_abi.json    # ABI copied from Remix after deployment
+├── FLBL2.sol                # Solidity smart contract (deployed via Remix IDE)
+└── FLBL2_abi.json           # ABI copied from Remix after deployment
 
 data/
 └── MHEALTHDATASET/          # MHEALTH dataset (downloaded separately — see Setup)
 
 outputs/                     # Auto-created at runtime
-├── results.json             # Per-round metrics (JSONL)
-├── perf_baseline_*.log      # Blockchain timing log (BLOCKCHAIN_OPTIMIZED=0)
-└── perf_optimized_*.log     # Blockchain timing log (BLOCKCHAIN_OPTIMIZED=1)
+├── baseline_YYYYMMDD_HHMMSS/   # Run folder with results.json, fl_server.log, perf log, plots
+├── optimized_YYYYMMDD_HHMMSS/  # Run folder with results.json, fl_server.log, perf log, plots
+├── latest -> <run-folder>/      # Symlink to most recent run
+└── tx_pin_map.csv               # Cross-run CID and transaction audit map
 
 final_model.pt               # Saved global model weights after all rounds
 pyproject.toml               # Flower project config & hyperparameters
@@ -146,20 +147,20 @@ pyproject.toml               # Flower project config & hyperparameters
 
 ### The Model
 
-**`Net`** (`fl_blockchain_evm/core/model.py`) is a 4-stage **SE-ResNet** (Squeeze-and-Excitation Residual Network) for 1-D time-series with **920,013 parameters**:
+**`Net`** (`fl_blockchain_evm/core/model.py`) is a 4-stage **SE-ResNet** (Squeeze-and-Excitation Residual Network) for 1-D time-series with **about 860K trainable parameters**:
 
 ```
 Input: (B, 23, 256)   — batch × 23 sensor channels × 256 time-steps @ 50 Hz
   └─ InputBN
-  └─ Stage 1: Conv1d(23→64,  k=7) → BN → ReLU → MaxPool(2) → 2× SEResBlock(64,  k=7)
-  └─ Stage 2: Conv1d(64→128, k=5) → BN → ReLU → MaxPool(2) → 2× SEResBlock(128, k=5)
-  └─ Stage 3: Conv1d(128→256,k=3) → BN → ReLU → MaxPool(2) → 2× SEResBlock(256, k=3)
-  └─ Stage 4: Conv1d(256→512,k=3) → BN → ReLU → MaxPool(2) → 1× SEResBlock(512, k=3)
-  └─ GlobalAvgPool → Dropout(0.3) → Linear(512→12)
+  └─ Stage 1: Conv1d(23→32,  k=7) → BN → ReLU → MaxPool(2) → 2× SEResBlock(32,  k=5)
+  └─ Stage 2: Conv1d(32→64,  k=5) → BN → ReLU → MaxPool(2) → 2× SEResBlock(64,  k=3)
+  └─ Stage 3: Conv1d(64→128, k=3) → BN → ReLU → MaxPool(2) → 2× SEResBlock(128, k=3)
+  └─ Stage 4: Conv1d(128→256,k=3) → BN → ReLU → MaxPool(2) → 1× SEResBlock(256, k=3)
+  └─ GlobalAvgPool → Dropout(0.3) → Linear(256→12)
 Output: (B, 12) raw logits — 12-class softmax classification
 ```
 
-~920K parameters. The SE block applies per-channel attention (squeeze-and-excitation ratio=16) after each residual pair, helping the network focus on the most discriminative sensor channels.
+~860K trainable parameters. The SE block applies per-channel attention (squeeze-and-excitation ratio=4 in this implementation) after each residual pair, helping the network focus on the most discriminative sensor channels.
 
 **Loss:** `FocalLoss` (γ=2) — down-weights easy examples and focuses training on hard-to-classify activity transitions.
 
@@ -233,7 +234,7 @@ The system uses **IPFS** (InterPlanetary File System) as a content-addressable o
 
 **RP4 design decisions:**
 - **No IPFS daemon on devices** — uses Pinata HTTP API (saves ~200 MB RAM vs kubo)
-- **Gzip compression** — 200K-param model: 800 KB → ~250 KB
+- **Gzip compression** — checkpoint payload measured at 3,439,144 bytes per round
 - **BytesIO streaming** — no temp files (avoids SD card wear on RP4)
 - **Exponential backoff with jitter** — handles flaky Wi-Fi on edge deployments
 - **Graceful degradation** — if IPFS is unreachable, FL training continues normally
@@ -251,7 +252,7 @@ The system uses **IPFS** (InterPlanetary File System) as a content-addressable o
 **Verifying IPFS content:**
 
 ```python
-from fl_blockchain_evm.ipfs_storage import IPFSStorage
+from fl_blockchain_evm.infra.ipfs_storage import IPFSStorage
 
 ipfs = IPFSStorage(backend="pinata")
 
@@ -303,7 +304,7 @@ This system is grounded in three converging research threads:
 **Key differentiators from prior work:**
 - Real production L2 deployment (not testnet or simulation)
 - Quantified per-round blockchain middleware overhead with baseline vs. optimised comparison
-- Hardware FL on 10 Raspberry Pi 4 devices (subjects 1–8 for training, 9–10 held-out), not simulated edge nodes
+- Hardware FL on 10 Raspberry Pi 4 devices, with subjects 1-8 used for training and subjects 9-10 held out for global evaluation
 - 12-class HAR (MHEALTH) with per-activity AUC reaching 99.9%
 
 ---
@@ -339,7 +340,7 @@ python-dotenv
   - Public RPC: `https://main.base.org` (free, no API key needed)
   - Or use Alchemy/Infura for better reliability
 - **Base main Network Details**
-  - Chain ID: 84532
+  - Chain ID: 8453
   - Explorer: [https://main.basescan.org](https://main.basescan.org)
   - Block time: ~2 seconds
   - Gas costs: Very low (L2 benefits)
@@ -391,20 +392,20 @@ The loader (`fl_blockchain_evm/core/data.py`) reads the `.log` files directly. N
 No Hardhat or local Node setup is needed. The contract is deployed directly from the browser using [Remix IDE](https://remix.ethereum.org).
 
 1. Open [https://remix.ethereum.org](https://remix.ethereum.org).
-2. Create a new file and paste the contents of `contracts/FLBlockchain.sol`.
+2. Create a new file and paste the contents of `contracts/FLBL2.sol`.
 3. In the **Solidity Compiler** tab, select compiler version `0.8.20` and compile.
 4. In the **Deploy & Run Transactions** tab:
    - Set environment to **Injected Provider - MetaMask** (make sure MetaMask is connected to **Base main**).
    - Click **Deploy**.
 5. After deployment, copy the **contract address** from the Remix console.
-6. In the **Compilation Details** panel, copy the **ABI** and save it as `FLBlockchain_abi.json` in the project root.
+6. In the **Compilation Details** panel, copy the **ABI** and save it as `contracts/FLBL2_abi.json`.
 
 > **Note:** You need real Base mainnet ETH for gas (not testnet). Bridge from Ethereum L1 via [Superbridge](https://superbridge.app).
 
 **To add Base main to MetaMask:**
 - Network Name: Base main
 - RPC URL: `https://main.base.org`
-- Chain ID: 84532
+- Chain ID: 8453
 - Currency Symbol: ETH
 - Block Explorer: `https://main.basescan.org`
 
@@ -413,7 +414,7 @@ No Hardhat or local Node setup is needed. The contract is deployed directly from
 Create a `.env` file in the project root (never commit this file):
 
 ```env
-BASE_main_RPC_URL=https://main.base.org
+BASE_SEPOLIA_RPC_URL=https://main.base.org
 PRIVATE_KEY=0x<YOUR_WALLET_PRIVATE_KEY>
 CONTRACT_ADDRESS=0x<DEPLOYED_CONTRACT_ADDRESS>
 
@@ -439,12 +440,12 @@ batch-size        = 64
 num-partitions    = 8
 ```
 
-The federation runs with **10 SuperNodes** (one per MHEALTH subject/device):
+Default simulation uses **8 SuperNodes** (one per training subject). The physical deployment can map these subjects onto 10 devices by assigning multiple devices to selected subjects:
 
 ```toml
 # local simulation example
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 10
+options.num-supernodes = 8
 options.backend.client_resources.num_cpus = 1
 options.backend.client_resources.num_gpus = 0
 ```
@@ -470,8 +471,8 @@ This launches a local simulation with 10 virtual clients (one per training subje
   1. `LOCAL` block - aggregated client training data
   2. `VOTE` block - acceptance/rejection decisions
   3. `GLOBAL` block - global model evaluation metrics
-- Results are saved to `outputs/results.json` (JSONL format)
-- Confusion matrices saved as `outputs/cm_round_N.png`
+- Results are saved to `outputs/<variant_timestamp>/results.json` (JSONL format)
+- Confusion matrices are saved inside the same run folder
 - Final model saved as `final_model.pt`
 
 ### Monitor training with the live dashboard
@@ -509,7 +510,7 @@ The dashboard shows:
 ### Verify blockchain integrity after the run
 
 ```python
-from fl_blockchain_evm.blockchain import EVMBlockchain
+from fl_blockchain_evm.infra.blockchain import EVMBlockchain
 bc = EVMBlockchain()
 print("Chain valid:", bc.verify_chain())
 print("Total blocks:", bc.get_chain_length())
@@ -524,13 +525,18 @@ After a successful run the following files are created:
 
 ```
 outputs/
-├── results.json          # JSONL — one JSON object per line, types:
-│                         #   "device_training"  — per-round client metrics
-│                         #   "client_eval"      — per-round client evaluation
-│                         #   "global"           — global eval + ipfs_cids (if enabled)
-├── cm_round_1.png        # Confusion matrix heatmap, round 1
-├── cm_round_2.png        # ...
-└── cm_round_N.png
+├── baseline_YYYYMMDD_HHMMSS/
+│   ├── results.json      # JSONL records for the run
+│   ├── fl_server.log
+│   ├── perf_baseline_*.log
+│   └── cm_round_N.png
+├── optimized_YYYYMMDD_HHMMSS/
+│   ├── results.json
+│   ├── fl_server.log
+│   ├── perf_optimized_*.log
+│   └── cm_round_N.png
+├── latest -> <run-folder>
+└── tx_pin_map.csv
 
 final_model.pt            # PyTorch state dict of the final global model
 ```
@@ -562,7 +568,7 @@ When IPFS is enabled, each `"global"` record in `results.json` includes an `ipfs
 ```python
 import json
 
-with open("outputs/results.json") as f:
+with open("outputs/latest/results.json") as f:
     records = [json.loads(line) for line in f if line.strip()]
 
 global_rounds = [r for r in records if r["type"] == "global"]
@@ -617,8 +623,8 @@ BLOCKCHAIN_OPTIMIZED=1
 Every run — regardless of mode — automatically creates a structured timing log in `outputs/`:
 
 ```
-outputs/perf_baseline_YYYYMMDD_HHMMSS.log   (when BLOCKCHAIN_OPTIMIZED=0)
-outputs/perf_optimized_YYYYMMDD_HHMMSS.log  (when BLOCKCHAIN_OPTIMIZED=1)
+outputs/<run_folder>/perf_baseline_YYYYMMDD_HHMMSS.log   (when BLOCKCHAIN_OPTIMIZED=0)
+outputs/<run_folder>/perf_optimized_YYYYMMDD_HHMMSS.log  (when BLOCKCHAIN_OPTIMIZED=1)
 ```
 
 **Log format** (one entry per event, with sub-millisecond timestamps):
@@ -652,22 +658,22 @@ In optimised mode, `estimate_ms` lines are replaced by `cached=<value>  saved_rp
 ```bash
 # Run 1 — baseline
 BLOCKCHAIN_OPTIMIZED=0 flwr run .
-# Produces: outputs/perf_baseline_<timestamp>.log
+# Produces: outputs/<run_folder>/perf_baseline_<timestamp>.log
 
 # Run 2 — optimised
 BLOCKCHAIN_OPTIMIZED=1 flwr run .
-# Produces: outputs/perf_optimized_<timestamp>.log
+# Produces: outputs/<run_folder>/perf_optimized_<timestamp>.log
 
 # Quick comparison (total overhead per round)
-grep "ROUND.*end" outputs/perf_baseline_*.log
-grep "ROUND.*end" outputs/perf_optimized_*.log
+grep "ROUND.*end" outputs/baseline_*/perf_baseline_*.log
+grep "ROUND.*end" outputs/optimized_*/perf_optimized_*.log
 ```
 
 ---
 
 ## Smart Contract
 
-**`contracts/FLBlockchain.sol`** — deployed on Base mainnet.
+**`contracts/FLBL2.sol`** — deployed on Base mainnet.
 
 Inherits from OpenZeppelin's `Ownable` and `Pausable`. Key design decisions:
 
