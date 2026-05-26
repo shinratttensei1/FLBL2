@@ -131,7 +131,7 @@ class EVMBlockchain:
         print(f"  [EVM] Balance: {balance_eth:.4f} ETH")
 
         # Load contract
-        with open('contracts/FLBlockchain_abi.json', 'r') as f:
+        with open('contracts/FLBL2_abi.json', 'r') as f:
             contract_abi = json.load(f)
 
         self.contract = self.w3.eth.contract(

@@ -55,7 +55,7 @@ def build_run_timeline() -> list:
     """Return list of (utc_start, utc_end, variant, pinata_account, dir_name)."""
     runs = []
     for run_dir in sorted(
-        glob.glob("outputs/baseline_*") + glob.glob("outputs/optimized_*")
+        glob.glob("outputs_ucihar/baseline_*") + glob.glob("outputs_ucihar/optimized_*")
     ):
         name  = os.path.basename(run_dir)
         parts = name.split("_")
@@ -116,7 +116,7 @@ def match_run(first_pin_utc: datetime, runs: list) -> tuple:
 # ── Load excluded time windows from excluded_blocks.json ─────────────────────
 def build_excluded_windows() -> list:
     """Return list of (start_dt, end_dt) for runs that must be excluded."""
-    path = "outputs/excluded_blocks.json"
+    path = "outputs_ucihar/excluded_blocks.json"
     if not os.path.exists(path):
         return []
     with open(path) as f:
@@ -240,8 +240,8 @@ def main():
         pin["complete"] = "yes" if cnt >= 40 and not excl else "no"
 
     # Write CSV
-    os.makedirs("outputs", exist_ok=True)
-    out = "outputs/pinata_pins.csv"
+    os.makedirs("outputs_ucihar", exist_ok=True)
+    out = "outputs_ucihar/pinata_pins.csv"
     fields = ["run_number", "variant", "pinata_account", "account",
               "ipfs_hash", "name", "size_bytes", "date_pinned",
               "mime_type", "excluded", "complete"]

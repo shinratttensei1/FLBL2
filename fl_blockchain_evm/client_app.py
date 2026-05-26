@@ -5,7 +5,7 @@ import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
-from fl_blockchain_evm.task import Net, load_data, train as train_fn, test as test_fn
+from fl_blockchain_evm.task import Net, load_data, train as train_fn, test as test_fn, NUM_CLASSES
 from fl_blockchain_evm.utils import get_device
 
 try:
@@ -164,7 +164,7 @@ def train(msg: Message, context: Context):
                           f"last_epoch={m['train_loss_last_epoch']:.5f}  "
                           f"improvement={m['train_loss_first_epoch']-m['train_loss_last_epoch']:.5f}  "
                           f"time={train_elapsed:.1f}s  "
-                          f"active_classes={active}/12  "
+                          f"active_classes={active}/{NUM_CLASSES}  "
                           f"cpu={hw['cpu_percent']}%  "
                           f"ram={hw['ram_used_mb']:.0f}MB  "
                           f"temp={hw['cpu_temp_c']}°C")

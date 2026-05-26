@@ -23,20 +23,23 @@ set -euo pipefail
 PI_HOSTS=(
     "raspberrypi1.local"   # partition 0
     "raspberrypi.local"    # partition 1
-    "raspberrypi2.local" # partition 2  ← uncomment to add a third Pi
-    "raspberrypi3.local" # partition 3  ← uncomment to add a fourth Pi
-    "raspberrypi4.local"
-    "raspberrypi5.local"
-    "raspberrypi6.local"
-    "raspberrypi7.local"
+    "raspberrypi2.local"   # partition 2
+    "raspberrypi3.local"   # partition 3
+    "raspberrypi4.local"   # partition 4
+    "raspberrypi5.local"   # partition 5
+    "raspberrypi6.local"   # partition 6
+    "raspberrypi7.local"   # partition 7
+    "raspberrypi8.local"   # partition 8
+    "raspberrypi9.local"   # partition 9
 )
 
 # ── Training defaults ──────────────────────────────────────────
 PI_USER="${PI_USER:-pi}"
 NUM_ROUNDS="${NUM_ROUNDS:-10}"
-LOCAL_EPOCHS="${LOCAL_EPOCHS:-1}"
-LR="${LR:-0.002}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+LOCAL_EPOCHS="${LOCAL_EPOCHS:-3}"
+LR="${LR:-0.001}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+N_SESSIONS="${N_SESSIONS:-10}"
 
 # Derived automatically — do not change
 NUM_PARTITIONS="${#PI_HOSTS[@]}"
@@ -79,6 +82,28 @@ pi_scp() {
 }
 
 check_pi() { pi_ssh "$1" "echo ok" >/dev/null 2>&1; }
+
+# Ping all Pis in parallel to wake their WiFi adapters from power-save doze,
+# then SSH in and turn off power management for the duration of the session.
+wake_pis() {
+    local hosts=("$@")
+    info "  Pinging Pis to wake WiFi adapters..."
+    local pids=()
+    for pi in "${hosts[@]}"; do
+        ping -c 2 -W 2 "$pi" >/dev/null 2>&1 &
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+    sleep 2
+
+    info "  Disabling WiFi power management on all Pis (session)..."
+    local pids2=()
+    for pi in "${hosts[@]}"; do
+        pi_ssh "$pi" "sudo iwconfig wlan0 power off 2>/dev/null || true" 2>/dev/null &
+        pids2+=($!)
+    done
+    for p in "${pids2[@]}"; do wait "$p" 2>/dev/null || true; done
+}
 
 server_ip() {
     local ip=""
@@ -158,6 +183,20 @@ set -e
 cd ~/FL-Blockchain-EVM
 _l() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+_l "Disabling WiFi power management (persistent)..."
+sudo iwconfig wlan0 power off 2>/dev/null || true
+sudo mkdir -p /etc/NetworkManager/conf.d
+sudo tee /etc/NetworkManager/conf.d/wifi-pm.conf > /dev/null << 'WIFICFG'
+[connection]
+wifi.powersave = 2
+WIFICFG
+sudo tee /etc/network/if-up.d/disable-wifi-pm > /dev/null << 'IFUP'
+#!/bin/sh
+iwconfig wlan0 power off 2>/dev/null || true
+IFUP
+sudo chmod +x /etc/network/if-up.d/disable-wifi-pm 2>/dev/null || true
+_l "WiFi power management disabled."
+
 _l "apt-get update..."
 sudo apt-get update -qq 2>/dev/null || true
 sudo apt-get install -y -qq build-essential python3 python3-venv python3-dev \
@@ -234,6 +273,8 @@ cmd_train() {
     info "  LR / Epochs     : $LR / $LOCAL_EPOCHS"
     info "  Flower ports    : Fleet=$SL_FLEET_PORT  Control=$SL_CONTROL_PORT"
     info "  Dashboard       : http://localhost:$DASHBOARD_PORT/monitor"
+
+    wake_pis "${PI_HOSTS[@]}"
 
     for pi in "${PI_HOSTS[@]}"; do
         check_pi "$pi" || die "$pi unreachable — run './fl.sh setup' first"
@@ -320,16 +361,15 @@ sleep 1
 
 export FL_DATA_DIR="\$HOME/FL-Blockchain-EVM/data/MHEALTHDATASET"
 
-_l "Starting flower-supernode..."
-flower-supernode \\
+_l "Starting flower-supernode (detached from SSH)..."
+nohup flower-supernode \\
     --insecure \\
     --superlink "${SRV_IP}:${SL_FLEET_PORT}" \\
     --node-config "partition-id=${part_id} num-partitions=${NUM_PARTITIONS}" \\
     --clientappio-api-address "0.0.0.0:${SN_CLIENTAPPIO_PORT}" \\
-    2>&1 | while IFS= read -r line; do
-        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$line" | tee -a "\$LOGF"
-    done
-_l "SuperNode exited."
+    >> "\$LOGF" 2>&1 &
+disown \$!
+_l "SuperNode running (PID=\$!), detached from SSH."
 PIRUN
 )
         echo "$script" | pi_ssh "$pi_host" bash > "$logf" 2>&1 &
@@ -459,6 +499,608 @@ PY
         err "Server  : tail outputs/fl_server.log"
     fi
     return "$rc"
+}
+
+# ─────────────────────────────────────────────────────────────
+#  SETUP-PAMAP2 — sync updated code + PAMAP2 data to all Pis
+# ─────────────────────────────────────────────────────────────
+cmd_setup_pamap2() {
+    local PAMAP2_HOSTS=("${PI_HOSTS[@]}")
+    step "PAMAP2 SETUP — ${#PAMAP2_HOSTS[@]} Pi(s)"
+
+    wake_pis "${PAMAP2_HOSTS[@]}"
+
+    info "Checking SSH connectivity..."
+    for pi in "${PAMAP2_HOSTS[@]}"; do
+        check_pi "$pi" \
+            && info "  ✓ $pi" \
+            || die "Cannot reach $pi. Enable SSH and verify: ssh ${PI_USER}@${pi}"
+    done
+
+    # Compute global norm stats on server (needs full dataset, only ~30s)
+    local norm_stats="$PROJECT_DIR/data/PAMAP2/Protocol/.norm_stats.npz"
+    if [ ! -f "$norm_stats" ]; then
+        step "Computing global normalization stats (runs once)"
+        activate_venv
+        cd "$PROJECT_DIR"
+        FL_DATA_DIR="$PROJECT_DIR/data/PAMAP2/Protocol" python3 -c "
+from fl_blockchain_evm.core.data import compute_and_save_norm_stats
+compute_and_save_norm_stats()
+"
+        info "  ✓ Norm stats saved → $norm_stats"
+    else
+        info "  ✓ Norm stats already computed → $norm_stats"
+    fi
+
+    step "Syncing code + PAMAP2 data to ${#PAMAP2_HOSTS[@]} Pi(s) in parallel"
+    mkdir -p "$LOG_DIR"
+
+    _deploy_pamap2() {
+        local pi_host="$1"
+        local logf="$LOG_DIR/setup_pamap2_${pi_host}.log"
+        {
+            echo "[$(ts)] ── PAMAP2 Setup: ${pi_host} ──"
+
+            echo "[$(ts)] Syncing source code..."
+            tar -czf - \
+                --exclude='venv' --exclude='.git' --exclude='__pycache__' \
+                --exclude='*.pyc' --exclude='outputs' --exclude='outputs_pamap2' \
+                --exclude='data' --exclude='.env' \
+                --exclude='final_model.pt' --exclude='*.bak' \
+                -C "$(dirname "$PROJECT_DIR")" "$(basename "$PROJECT_DIR")" \
+            | pi_ssh "$pi_host" \
+                "cd ~ \
+                 && tar -xzf - --warning=no-unknown-keyword 2>/dev/null \
+                 && dirname_tar=\$(ls -d ~/FL-Blockchain-EVM* 2>/dev/null | head -1) \
+                 && [ -d ~/FL-Blockchain-EVM ] || mv \"\$dirname_tar\" ~/FL-Blockchain-EVM \
+                 && chmod +x ~/FL-Blockchain-EVM/fl.sh \
+                 && echo '[$(ts)] Code synced'"
+
+            echo "[$(ts)] Syncing PAMAP2 data..."
+            local data_src="$PROJECT_DIR/data/PAMAP2/Protocol"
+            pi_ssh "$pi_host" "mkdir -p ~/FL-Blockchain-EVM/data/PAMAP2/Protocol/.npy_cache"
+            if ls "$data_src"/subject*.dat 1>/dev/null 2>&1; then
+                rsync -a --size-only \
+                    "$data_src"/subject*.dat \
+                    "${PI_USER}@${pi_host}:~/FL-Blockchain-EVM/data/PAMAP2/Protocol/"
+                echo "[$(ts)] Synced $(ls "$data_src"/subject*.dat | wc -l | tr -d ' ') subject files."
+            else
+                echo "[$(ts)] WARNING: no subject*.dat files found in $data_src"
+            fi
+            if ls "$data_src/.npy_cache"/s*.npy 1>/dev/null 2>&1; then
+                rsync -a --size-only \
+                    "$data_src/.npy_cache"/s*.npy \
+                    "${PI_USER}@${pi_host}:~/FL-Blockchain-EVM/data/PAMAP2/Protocol/.npy_cache/"
+                echo "[$(ts)] Synced npy cache."
+            fi
+            if [ -f "$data_src/.norm_stats.npz" ]; then
+                pi_scp -q "$data_src/.norm_stats.npz" \
+                    "${PI_USER}@${pi_host}:~/FL-Blockchain-EVM/data/PAMAP2/Protocol/.norm_stats.npz"
+                echo "[$(ts)] Synced norm stats."
+            fi
+
+            [ -f "$PROJECT_DIR/.env" ] && \
+                pi_scp -q "$PROJECT_DIR/.env" "${PI_USER}@${pi_host}:~/FL-Blockchain-EVM/.env" && \
+                echo "[$(ts)] .env copied."
+
+            echo "[$(ts)] Disabling WiFi power management (persistent)..."
+            pi_ssh "$pi_host" bash << 'WIFIFIX'
+sudo iwconfig wlan0 power off 2>/dev/null || true
+sudo mkdir -p /etc/NetworkManager/conf.d
+printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/wifi-pm.conf > /dev/null
+printf '#!/bin/sh\niwconfig wlan0 power off 2>/dev/null || true\n' | sudo tee /etc/network/if-up.d/disable-wifi-pm > /dev/null
+sudo chmod +x /etc/network/if-up.d/disable-wifi-pm 2>/dev/null || true
+WIFIFIX
+            echo "[$(ts)] WiFi power management disabled."
+
+            echo "[$(ts)] ✓ ${pi_host} done."
+        } 2>&1 | tee "$logf"
+    }
+
+    local pids=()
+    for pi in "${PAMAP2_HOSTS[@]}"; do
+        _deploy_pamap2 "$pi" &
+        pids+=($!)
+    done
+
+    local ok=true
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { err "${PAMAP2_HOSTS[$i]} failed → $LOG_DIR/setup_pamap2_${PAMAP2_HOSTS[$i]}.log"; ok=false; }
+    done
+    [ "$ok" = "true" ] || exit 1
+
+    step "PAMAP2 SETUP COMPLETE"
+    info "  Run './fl.sh train-pamap2' to start training."
+}
+
+# ─────────────────────────────────────────────────────────────
+#  TRAIN-PAMAP2 — N_SESSIONS baseline + N_SESSIONS optimized
+#                 All sessions write to outputs_pamap2/
+# ─────────────────────────────────────────────────────────────
+cmd_train_pamap2() {
+    local n_sessions="${N_SESSIONS:-5}"
+    local PAMAP2_HOSTS=("${PI_HOSTS[@]}")
+    local PAMAP2_PARTS="${#PAMAP2_HOSTS[@]}"
+
+    step "FL PAMAP2 — ${n_sessions} baseline + ${n_sessions} optimized sessions  (${PAMAP2_PARTS} clients)"
+
+    local SRV_IP="${SERVER_IP:-$(server_ip)}"
+    [ -n "$SRV_IP" ] || die "Could not detect laptop IP.\nSet: SERVER_IP=192.168.x.x ./fl.sh train-pamap2"
+
+    info "  Server IP       : $SRV_IP"
+    for i in "${!PAMAP2_HOSTS[@]}"; do
+        info "  Pi $i (part. $i)  : ${PAMAP2_HOSTS[$i]}"
+    done
+    info "  Sessions        : ${n_sessions} baseline + ${n_sessions} optimized"
+    info "  Rounds/session  : $NUM_ROUNDS"
+    info "  Output dir      : outputs_pamap2/"
+
+    wake_pis "${PAMAP2_HOSTS[@]}"
+
+    for pi in "${PAMAP2_HOSTS[@]}"; do
+        check_pi "$pi" || die "$pi unreachable — run './fl.sh setup-pamap2' first"
+        info "  ✓ $pi reachable"
+    done
+
+    activate_venv
+    mkdir -p "$LOG_DIR" "outputs_pamap2"
+
+    export FL_DATA_DIR="$PROJECT_DIR/data/PAMAP2/Protocol"
+    export FL_PROJECT_DIR="$PROJECT_DIR"
+    export OUTPUT_BASE_DIR="outputs_pamap2"
+
+    _SL_PID="" _DASH_PID=""
+    cleanup() {
+        step "SHUTDOWN"
+        [ -n "$_SL_PID"   ] && kill "$_SL_PID"   2>/dev/null && info "  ✓ SuperLink stopped"  || true
+        [ -n "$_DASH_PID" ] && kill "$_DASH_PID"  2>/dev/null && info "  ✓ Dashboard stopped"  || true
+        pkill -f "flower-superlink" 2>/dev/null || true
+        for pi in "${PAMAP2_HOSTS[@]}"; do
+            pi_ssh "$pi" "pkill -f flower-supernode 2>/dev/null; true" 2>/dev/null &
+        done
+        wait; info "  ✓ Pi processes stopped"
+    }
+    trap cleanup EXIT
+
+    # ── 1. Dashboard ─────────────────────────────────────────
+    step "1/4  Dashboard"
+    python run_dashboard.py > "$LOG_DIR/dashboard.log" 2>&1 &
+    _DASH_PID=$!
+    sleep 2
+    kill -0 "$_DASH_PID" 2>/dev/null \
+        && info "  ✓ Dashboard → http://localhost:${DASHBOARD_PORT}/monitor" \
+        || warn "  Dashboard failed (training continues)"
+
+    # ── 2. SuperLink ─────────────────────────────────────────
+    step "2/4  Flower SuperLink"
+    pkill -f "flower-superlink" 2>/dev/null || true; sleep 1
+
+    cd "$PROJECT_DIR"
+    flower-superlink \
+        --insecure \
+        --serverappio-api-address "0.0.0.0:${SL_SERVERAPPIO_PORT}" \
+        --fleet-api-address       "0.0.0.0:${SL_FLEET_PORT}" \
+        --control-api-address     "0.0.0.0:${SL_CONTROL_PORT}" \
+        > "$LOG_DIR/superlink.log" 2>&1 &
+    _SL_PID=$!
+    sleep 3
+    kill -0 "$_SL_PID" 2>/dev/null \
+        || { err "SuperLink failed to start"; cat "$LOG_DIR/superlink.log"; exit 1; }
+    info "  ✓ SuperLink PID=$_SL_PID  Fleet: $SRV_IP:$SL_FLEET_PORT"
+
+    # ── 3. SuperNodes on 7 Pis ───────────────────────────────
+    step "3/4  SuperNodes on ${PAMAP2_PARTS} Pi(s)"
+
+    _start_pamap2_supernode() {
+        local pi_host="$1" part_id="$2"
+        local logf="$LOG_DIR/supernode_pamap2_${part_id}.log"
+
+        local script
+        script=$(cat << PIRUN
+set -e
+LOGF="/tmp/fl_client_pamap2_${part_id}.log"
+: > "\$LOGF"
+_l() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" | tee -a "\$LOGF"; }
+
+_l "════════════════════════════════════════════════════"
+_l "  FL SuperNode (PAMAP2) — Partition ${part_id} / ${PAMAP2_PARTS}"
+_l "  Host      : \$(hostname)  (${pi_host})"
+_l "  Server    : ${SRV_IP}:${SL_FLEET_PORT}"
+_l "  DATA_DIR  : \$HOME/FL-Blockchain-EVM/data/PAMAP2/Protocol"
+_l "════════════════════════════════════════════════════"
+
+cd ~/FL-Blockchain-EVM
+source venv/bin/activate
+pkill -f flower-supernode 2>/dev/null && _l "Killed stale supernode" || true
+sleep 1
+
+export FL_DATA_DIR="\$HOME/FL-Blockchain-EVM/data/PAMAP2/Protocol"
+
+_l "Starting flower-supernode (detached from SSH)..."
+nohup flower-supernode \\
+    --insecure \\
+    --superlink "${SRV_IP}:${SL_FLEET_PORT}" \\
+    --node-config "partition-id=${part_id} num-partitions=${PAMAP2_PARTS}" \\
+    --clientappio-api-address "0.0.0.0:${SN_CLIENTAPPIO_PORT}" \\
+    >> "\$LOGF" 2>&1 &
+disown \$!
+_l "SuperNode running (PID=\$!), detached from SSH."
+PIRUN
+)
+        echo "$script" | pi_ssh "$pi_host" bash > "$logf" 2>&1 &
+        sleep 2
+        info "  ✓ SuperNode ${part_id} started on ${pi_host}"
+        info "    Remote log : ssh ${PI_USER}@${pi_host} tail -f /tmp/fl_client_pamap2_${part_id}.log"
+    }
+
+    for i in "${!PAMAP2_HOSTS[@]}"; do
+        _start_pamap2_supernode "${PAMAP2_HOSTS[$i]}" "$i"
+    done
+
+    info ""
+    info "  Waiting 15s for SuperNodes to register..."
+    sleep 15
+
+    # Update pyproject.toml address
+    if ! grep -q '^\[tool\.flwr\.federations\]' pyproject.toml; then
+        printf '\n[tool.flwr.federations]\ndefault = "remote-federation"\n' >> pyproject.toml
+    fi
+    if ! grep -q '^\[tool\.flwr\.federations\.remote-federation\]' pyproject.toml; then
+        printf '\n[tool.flwr.federations.remote-federation]\naddress = "%s:%s"\ninsecure = true\n' \
+            "$SRV_IP" "$SL_CONTROL_PORT" >> pyproject.toml
+    fi
+    sed -i.bak \
+        -e "/^\[tool\.flwr\.federations\.remote-federation\]/,/^\[/ s|^address = \".*\"|address = \"${SRV_IP}:${SL_CONTROL_PORT}\"|" \
+        -e "/^\[tool\.flwr\.federations\.remote-federation\]/,/^\[/ s|^insecure = .*|insecure = true|" \
+        pyproject.toml
+    sed -i.bak \
+        -e "s/^num-server-rounds = .*/num-server-rounds = ${NUM_ROUNDS}/" \
+        -e "s/^lr = .*/lr = ${LR}/" \
+        -e "s/^local-epochs = .*/local-epochs = ${LOCAL_EPOCHS}/" \
+        -e "s/^batch-size = .*/batch-size = ${BATCH_SIZE}/" \
+        -e "s/^num-partitions = .*/num-partitions = ${PAMAP2_PARTS}/" \
+        pyproject.toml
+    info "  pyproject.toml updated (rounds=$NUM_ROUNDS  partitions=$PAMAP2_PARTS)"
+
+    # ── 4. Session loop ──────────────────────────────────────
+    step "4/4  Session loop"
+
+    _run_pamap2_session() {
+        local variant="$1" sess="$2" bc_opt="$3"
+        step "SESSION ${sess}/${n_sessions}  variant=${variant}  BLOCKCHAIN_OPTIMIZED=${bc_opt}"
+        export EXPERIMENT_VARIANT="$variant"
+        export BLOCKCHAIN_OPTIMIZED="$bc_opt"
+
+        flwr run . remote-federation \
+            --run-config "num-server-rounds=${NUM_ROUNDS} lr=${LR} local-epochs=${LOCAL_EPOCHS} batch-size=${BATCH_SIZE} fraction-train=1.0 num-partitions=${PAMAP2_PARTS} experiment-variant=\"${variant}\" blockchain-optimized=${bc_opt}" \
+            --stream \
+            2>&1 | tee "$LOG_DIR/training_${variant}_s${sess}.log"
+
+        local rc="${PIPESTATUS[0]}"
+        if [ "$rc" -eq 0 ]; then
+            info "  ✓ Session ${sess} (${variant}) complete."
+        else
+            err "  Session ${sess} (${variant}) exited with code $rc"
+        fi
+
+        info "  Sleeping 15s between sessions..."
+        sleep 15
+    }
+
+    step "ALTERNATING PHASE  (${n_sessions} baseline + ${n_sessions} optimized, interleaved)"
+    for s in $(seq 1 "$n_sessions"); do
+        _run_pamap2_session "baseline"  "$s" "0"
+        _run_pamap2_session "optimized" "$s" "1"
+    done
+
+    step "ALL PAMAP2 SESSIONS COMPLETE"
+    info "  Output: outputs_pamap2/"
+    activate_venv 2>/dev/null || true
+    python3 - "outputs_pamap2" << 'PY' 2>/dev/null || true
+import json, os, sys, glob
+base = sys.argv[1]
+sessions = sorted(glob.glob(f"{base}/*/results.json"))
+if not sessions:
+    print("  (no completed sessions found)")
+else:
+    for path in sessions:
+        folder = os.path.basename(os.path.dirname(path))
+        rounds = []
+        with open(path) as f:
+            for line in f:
+                try:
+                    o = json.loads(line.strip())
+                    if isinstance(o, dict) and o.get("type") == "global":
+                        rounds.append(o)
+                except Exception:
+                    pass
+        if rounds:
+            r = rounds[-1]
+            print(f"  {folder:<40}  acc={r.get('accuracy',0):.4f}  "
+                  f"f1={r.get('f1_macro',0):.4f}  auc={r.get('auc_macro',0):.4f}")
+PY
+}
+
+# ─────────────────────────────────────────────────────────────
+#  SETUP-UCIHAR — sync code + UCI HAR data to all Pis
+# ─────────────────────────────────────────────────────────────
+cmd_setup_ucihar() {
+    local UCI_HOSTS=("${PI_HOSTS[@]}")
+    step "UCI HAR SETUP — ${#UCI_HOSTS[@]} Pi(s)"
+
+    wake_pis "${UCI_HOSTS[@]}"
+
+    info "Checking SSH connectivity..."
+    for pi in "${UCI_HOSTS[@]}"; do
+        check_pi "$pi" \
+            && info "  ✓ $pi" \
+            || die "Cannot reach $pi. Verify: ssh ${PI_USER}@${pi}"
+    done
+
+    local uci_data="$PROJECT_DIR/data/UCI_HAR/UCI_HAR_Dataset"
+    local norm_stats="$uci_data/.norm_stats.npz"
+    if [ ! -f "$norm_stats" ]; then
+        step "Computing global normalization stats (runs once)"
+        activate_venv
+        cd "$PROJECT_DIR"
+        FL_DATASET=ucihar FL_DATA_DIR="$uci_data" python3 -c "
+from fl_blockchain_evm.core.data_ucihar import compute_and_save_norm_stats
+compute_and_save_norm_stats()
+"
+        info "  ✓ Norm stats saved → $norm_stats"
+    else
+        info "  ✓ Norm stats already computed → $norm_stats"
+    fi
+
+    step "Syncing code + UCI HAR data to ${#UCI_HOSTS[@]} Pi(s) in parallel"
+    mkdir -p "$LOG_DIR"
+
+    _deploy_ucihar() {
+        local pi_host="$1"
+        local logf="$LOG_DIR/setup_ucihar_${pi_host}.log"
+        {
+            echo "[$(ts)] ── UCI HAR Setup: ${pi_host} ──"
+
+            echo "[$(ts)] Syncing source code..."
+            tar -czf - \
+                --exclude='venv' --exclude='.git' --exclude='__pycache__' \
+                --exclude='*.pyc' --exclude='outputs' --exclude='outputs_pamap2' \
+                --exclude='outputs_ucihar' --exclude='data' --exclude='.env' \
+                --exclude='final_model.pt' --exclude='*.bak' \
+                -C "$(dirname "$PROJECT_DIR")" "$(basename "$PROJECT_DIR")" \
+            | pi_ssh "$pi_host" \
+                "cd ~ \
+                 && tar -xzf - --warning=no-unknown-keyword 2>/dev/null \
+                 && [ -d ~/FL-Blockchain-EVM ] || mv ~/FL-Blockchain-EVM* ~/FL-Blockchain-EVM \
+                 && chmod +x ~/FL-Blockchain-EVM/fl.sh \
+                 && echo 'Code synced'"
+
+            echo "[$(ts)] Syncing UCI HAR data..."
+            pi_ssh "$pi_host" "mkdir -p ~/FL-Blockchain-EVM/data/UCI_HAR/UCI_HAR_Dataset/train/Inertial\ Signals ~/FL-Blockchain-EVM/data/UCI_HAR/UCI_HAR_Dataset/test/Inertial\ Signals"
+            rsync -a --size-only \
+                "$uci_data/train/" \
+                "${PI_USER}@${pi_host}:FL-Blockchain-EVM/data/UCI_HAR/UCI_HAR_Dataset/train/"
+            rsync -a --size-only \
+                "$uci_data/test/" \
+                "${PI_USER}@${pi_host}:FL-Blockchain-EVM/data/UCI_HAR/UCI_HAR_Dataset/test/"
+            if [ -f "$uci_data/.norm_stats.npz" ]; then
+                pi_scp -q "$uci_data/.norm_stats.npz" \
+                    "${PI_USER}@${pi_host}:FL-Blockchain-EVM/data/UCI_HAR/UCI_HAR_Dataset/.norm_stats.npz"
+            fi
+            echo "[$(ts)] UCI HAR data synced."
+
+            [ -f "$PROJECT_DIR/.env" ] && \
+                pi_scp -q "$PROJECT_DIR/.env" "${PI_USER}@${pi_host}:~/FL-Blockchain-EVM/.env"
+
+            pi_ssh "$pi_host" bash << 'WIFIFIX'
+sudo iwconfig wlan0 power off 2>/dev/null || true
+sudo mkdir -p /etc/NetworkManager/conf.d
+printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/wifi-pm.conf > /dev/null
+printf '#!/bin/sh\niwconfig wlan0 power off 2>/dev/null || true\n' | sudo tee /etc/network/if-up.d/disable-wifi-pm > /dev/null
+sudo chmod +x /etc/network/if-up.d/disable-wifi-pm 2>/dev/null || true
+WIFIFIX
+            echo "[$(ts)] ✓ ${pi_host} done."
+        } 2>&1 | tee "$logf"
+    }
+
+    local pids=()
+    for pi in "${UCI_HOSTS[@]}"; do
+        _deploy_ucihar "$pi" &
+        pids+=($!)
+    done
+    local ok=true
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { err "${UCI_HOSTS[$i]} failed → $LOG_DIR/setup_ucihar_${UCI_HOSTS[$i]}.log"; ok=false; }
+    done
+    [ "$ok" = "true" ] || exit 1
+
+    step "UCI HAR SETUP COMPLETE"
+    info "  Run './fl.sh train-ucihar' to start training."
+}
+
+# ─────────────────────────────────────────────────────────────
+#  TRAIN-UCIHAR — N_SESSIONS baseline + N_SESSIONS optimized
+#                 All sessions write to outputs_ucihar/
+# ─────────────────────────────────────────────────────────────
+cmd_train_ucihar() {
+    local n_sessions="${N_SESSIONS:-10}"
+    local UCI_HOSTS=("${PI_HOSTS[@]}")
+    local UCI_PARTS="${#UCI_HOSTS[@]}"
+    local UCI_ROUNDS="${NUM_ROUNDS:-20}"
+    local UCI_DATA="$PROJECT_DIR/data/UCI_HAR/UCI_HAR_Dataset"
+
+    step "FL UCI HAR — ${n_sessions}+${n_sessions} sessions  (${UCI_PARTS} clients, ${UCI_ROUNDS} rounds)"
+
+    local SRV_IP="${SERVER_IP:-$(server_ip)}"
+    [ -n "$SRV_IP" ] || die "Could not detect server IP. Set SERVER_IP=..."
+
+    info "  Server IP  : $SRV_IP"
+    for i in "${!UCI_HOSTS[@]}"; do info "  Pi $i  : ${UCI_HOSTS[$i]}"; done
+    info "  Sessions   : ${n_sessions} baseline + ${n_sessions} optimized"
+    info "  Rounds     : $UCI_ROUNDS  |  LR: $LR  |  Epochs: $LOCAL_EPOCHS"
+    info "  Output dir : outputs_ucihar/"
+
+    wake_pis "${UCI_HOSTS[@]}"
+    for pi in "${UCI_HOSTS[@]}"; do
+        check_pi "$pi" || die "$pi unreachable — run './fl.sh setup-ucihar' first"
+        info "  ✓ $pi reachable"
+    done
+
+    activate_venv
+    mkdir -p "$LOG_DIR" "outputs_ucihar"
+
+    export FL_DATASET="ucihar"
+    export FL_DATA_DIR="$UCI_DATA"
+    export OUTPUT_BASE_DIR="outputs_ucihar"
+
+    _SL_PID="" _DASH_PID=""
+    cleanup() {
+        step "SHUTDOWN"
+        [ -n "$_SL_PID"  ] && kill "$_SL_PID"  2>/dev/null && info "  ✓ SuperLink stopped" || true
+        [ -n "$_DASH_PID"] && kill "$_DASH_PID" 2>/dev/null && info "  ✓ Dashboard stopped" || true
+        pkill -f "flower-superlink" 2>/dev/null || true
+        for pi in "${UCI_HOSTS[@]}"; do
+            pi_ssh "$pi" "pkill -f flower-supernode 2>/dev/null; true" 2>/dev/null &
+        done
+        wait; info "  ✓ Pi processes stopped"
+    }
+    trap cleanup EXIT
+
+    step "1/4  Dashboard"
+    python run_dashboard.py > "$LOG_DIR/dashboard.log" 2>&1 &
+    _DASH_PID=$!
+    sleep 2
+    kill -0 "$_DASH_PID" 2>/dev/null \
+        && info "  ✓ Dashboard → http://localhost:${DASHBOARD_PORT}/monitor" \
+        || warn "  Dashboard failed (training continues)"
+
+    step "2/4  Flower SuperLink"
+    pkill -f "flower-superlink" 2>/dev/null || true; sleep 1
+    cd "$PROJECT_DIR"
+    flower-superlink \
+        --insecure \
+        --serverappio-api-address "0.0.0.0:${SL_SERVERAPPIO_PORT}" \
+        --fleet-api-address       "0.0.0.0:${SL_FLEET_PORT}" \
+        --control-api-address     "0.0.0.0:${SL_CONTROL_PORT}" \
+        > "$LOG_DIR/superlink.log" 2>&1 &
+    _SL_PID=$!
+    sleep 3
+    kill -0 "$_SL_PID" 2>/dev/null \
+        || { err "SuperLink failed"; cat "$LOG_DIR/superlink.log"; exit 1; }
+    info "  ✓ SuperLink PID=$_SL_PID  Fleet: $SRV_IP:$SL_FLEET_PORT"
+
+    step "3/4  SuperNodes on ${UCI_PARTS} Pi(s)"
+
+    _start_ucihar_supernode() {
+        local pi_host="$1" part_id="$2"
+        local script
+        script=$(cat << PIRUN
+set -e
+LOGF="/tmp/fl_client_ucihar_${part_id}.log"
+: > "\$LOGF"
+_l() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$*" | tee -a "\$LOGF"; }
+_l "UCI HAR SuperNode — Partition ${part_id}/${UCI_PARTS}  host=\$(hostname)  RAM=\$(free -m | awk '/^Mem/{print \$2}')MB"
+cd ~/FL-Blockchain-EVM
+source venv/bin/activate
+pkill -f flower-supernode 2>/dev/null && _l "Killed stale supernode" || true
+sleep 1
+export FL_DATASET="ucihar"
+export FL_DATA_DIR="\$HOME/FL-Blockchain-EVM/data/UCI_HAR/UCI_HAR_Dataset"
+nohup flower-supernode \\
+    --insecure \\
+    --superlink "${SRV_IP}:${SL_FLEET_PORT}" \\
+    --node-config "partition-id=${part_id} num-partitions=${UCI_PARTS}" \\
+    --clientappio-api-address "0.0.0.0:${SN_CLIENTAPPIO_PORT}" \\
+    >> "\$LOGF" 2>&1 &
+disown \$!
+_l "SuperNode running (PID=\$!)"
+PIRUN
+)
+        echo "$script" | pi_ssh "$pi_host" bash > "$LOG_DIR/supernode_ucihar_${part_id}.log" 2>&1 &
+        sleep 2
+        info "  ✓ SuperNode ${part_id} on ${pi_host}  (log: ssh ${PI_USER}@${pi_host} tail -f /tmp/fl_client_ucihar_${part_id}.log)"
+    }
+
+    for i in "${!UCI_HOSTS[@]}"; do
+        _start_ucihar_supernode "${UCI_HOSTS[$i]}" "$i"
+    done
+    info "  Waiting 15s for SuperNodes to register..."
+    sleep 15
+
+    if ! grep -q '^\[tool\.flwr\.federations\]' pyproject.toml; then
+        printf '\n[tool.flwr.federations]\ndefault = "remote-federation"\n' >> pyproject.toml
+    fi
+    if ! grep -q '^\[tool\.flwr\.federations\.remote-federation\]' pyproject.toml; then
+        printf '\n[tool.flwr.federations.remote-federation]\naddress = "%s:%s"\ninsecure = true\n' \
+            "$SRV_IP" "$SL_CONTROL_PORT" >> pyproject.toml
+    fi
+    sed -i.bak \
+        -e "/^\[tool\.flwr\.federations\.remote-federation\]/,/^\[/ s|^address = \".*\"|address = \"${SRV_IP}:${SL_CONTROL_PORT}\"|" \
+        -e "/^\[tool\.flwr\.federations\.remote-federation\]/,/^\[/ s|^insecure = .*|insecure = true|" \
+        pyproject.toml
+    sed -i.bak \
+        -e "s/^num-server-rounds = .*/num-server-rounds = ${UCI_ROUNDS}/" \
+        -e "s/^lr = .*/lr = ${LR}/" \
+        -e "s/^local-epochs = .*/local-epochs = ${LOCAL_EPOCHS}/" \
+        -e "s/^batch-size = .*/batch-size = ${BATCH_SIZE}/" \
+        -e "s/^num-partitions = .*/num-partitions = ${UCI_PARTS}/" \
+        pyproject.toml
+    info "  pyproject.toml updated (rounds=$UCI_ROUNDS  partitions=$UCI_PARTS)"
+
+    step "4/4  Session loop"
+
+    _run_ucihar_session() {
+        local variant="$1" sess="$2" bc_opt="$3"
+        step "SESSION ${sess}/${n_sessions}  variant=${variant}"
+        export EXPERIMENT_VARIANT="$variant"
+        export BLOCKCHAIN_OPTIMIZED="$bc_opt"
+        export FL_DATASET="ucihar"
+        export FL_DATA_DIR="$UCI_DATA"
+        export OUTPUT_BASE_DIR="outputs_ucihar"
+
+        flwr run . remote-federation \
+            --run-config "num-server-rounds=${UCI_ROUNDS} lr=${LR} local-epochs=${LOCAL_EPOCHS} batch-size=${BATCH_SIZE} fraction-train=1.0 num-partitions=${UCI_PARTS} experiment-variant=\"${variant}\" blockchain-optimized=${bc_opt}" \
+            --stream \
+            2>&1 | tee "$LOG_DIR/training_ucihar_${variant}_s${sess}.log"
+
+        local rc="${PIPESTATUS[0]}"
+        [ "$rc" -eq 0 ] && info "  ✓ Session ${sess} (${variant}) complete." \
+                        || err "  Session ${sess} (${variant}) exited with code $rc"
+        info "  Sleeping 15s..."; sleep 15
+    }
+
+    step "ALTERNATING PHASE  (${n_sessions} baseline + ${n_sessions} optimized, interleaved)"
+    for s in $(seq 1 "$n_sessions"); do
+        _run_ucihar_session "baseline"  "$s" "0"
+        _run_ucihar_session "optimized" "$s" "1"
+    done
+
+    step "ALL UCI HAR SESSIONS COMPLETE"
+    info "  Output: outputs_ucihar/"
+    activate_venv 2>/dev/null || true
+    python3 - "outputs_ucihar" << 'PY' 2>/dev/null || true
+import json, os, sys, glob
+base = sys.argv[1]
+sessions = sorted(glob.glob(f"{base}/*/results.json"))
+if not sessions:
+    print("  (no completed sessions found)")
+else:
+    for path in sessions:
+        folder = os.path.basename(os.path.dirname(path))
+        rounds = []
+        with open(path) as f:
+            for line in f:
+                try:
+                    o = json.loads(line.strip())
+                    if isinstance(o, dict) and o.get("type") == "global":
+                        rounds.append(o)
+                except Exception:
+                    pass
+        if rounds:
+            r = rounds[-1]
+            print(f"  {folder:<40}  acc={r.get('accuracy',0):.4f}  "
+                  f"f1={r.get('f1_macro',0):.4f}  auc={r.get('auc_macro',0):.4f}")
+PY
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -595,33 +1237,47 @@ PY
 # ─────────────────────────────────────────────────────────────
 CMD="${1:-help}"; shift 2>/dev/null || true
 case "$CMD" in
-    setup)  cmd_setup  ;;
-    train)  cmd_train  ;;
-    stop)   cmd_stop   ;;
-    logs)   cmd_logs   ;;
-    status) cmd_status ;;
+    setup)          cmd_setup          ;;
+    train)          cmd_train          ;;
+    setup-pamap2)   cmd_setup_pamap2   ;;
+    train-pamap2)   cmd_train_pamap2   ;;
+    setup-ucihar)   cmd_setup_ucihar   ;;
+    train-ucihar)   cmd_train_ucihar   ;;
+    stop)           cmd_stop           ;;
+    logs)           cmd_logs           ;;
+    status)         cmd_status         ;;
     *)
         echo -e ""
         echo -e "${B}FL — Federated Learning (${NUM_PARTITIONS} × Raspberry Pi 4)${N}"
         echo -e ""
         echo -e "Usage: ${B}./fl.sh <command>${N}"
         echo -e ""
-        printf "  ${G}%-8s${N}  %s\n" "setup"  "Deploy code + data to all Pis, install all deps"
-        printf "  ${G}%-8s${N}  %s\n" "train"  "Start: SuperLink + dashboard + SuperNodes + flwr run"
-        printf "  ${G}%-8s${N}  %s\n" "stop"   "Stop all FL processes on laptop and all Pis"
-        printf "  ${G}%-8s${N}  %s\n" "logs"   "Stream live logs from all devices simultaneously"
-        printf "  ${G}%-8s${N}  %s\n" "status" "Show training progress and system health"
+        echo -e "${C}── MHEALTH ──────────────────────────────────────────────${N}"
+        printf "  ${G}%-16s${N}  %s\n" "setup"         "Deploy MHEALTH code + data to all Pis, install deps"
+        printf "  ${G}%-16s${N}  %s\n" "train"         "Run one FL session (MHEALTH, outputs/)"
         echo -e ""
-        echo -e "Env overrides:  PI_USER=pi  NUM_ROUNDS=10  LOCAL_EPOCHS=1  BATCH_SIZE=256  LR=0.002  SERVER_IP=..."
+        echo -e "${C}── UCI HAR ──────────────────────────────────────────────${N}"
+        printf "  ${G}%-16s${N}  %s\n" "setup-ucihar"  "Sync UCI HAR code + data to all Pis"
+        printf "  ${G}%-16s${N}  %s\n" "train-ucihar"  "Run N_SESSIONS baseline + N_SESSIONS optimized (outputs_ucihar/)"
+        echo -e ""
+        echo -e "${C}── PAMAP2 ───────────────────────────────────────────────${N}"
+        printf "  ${G}%-16s${N}  %s\n" "setup-pamap2"  "Sync PAMAP2 code + data to all Pis"
+        printf "  ${G}%-16s${N}  %s\n" "train-pamap2"  "Run N_SESSIONS baseline + N_SESSIONS optimized (outputs_pamap2/)"
+        echo -e ""
+        echo -e "${C}── GENERAL ──────────────────────────────────────────────${N}"
+        printf "  ${G}%-16s${N}  %s\n" "stop"          "Stop all FL processes on laptop and all Pis"
+        printf "  ${G}%-16s${N}  %s\n" "logs"          "Stream live logs from all devices simultaneously"
+        printf "  ${G}%-16s${N}  %s\n" "status"        "Show training progress and system health"
+        echo -e ""
+        echo -e "Env overrides:  PI_USER=pi  NUM_ROUNDS=10  N_SESSIONS=5  LOCAL_EPOCHS=1  BATCH_SIZE=256  LR=0.002  SERVER_IP=..."
         echo -e ""
         echo -e "Pis configured (${NUM_PARTITIONS} total):"
         for i in "${!PI_HOSTS[@]}"; do
             echo -e "  Pi${i} → ${PI_HOSTS[$i]}  (partition $i)"
         done
         echo -e ""
-        echo -e "To add a Pi: edit PI_HOSTS array at the top of this file"
-        echo -e ""
-        echo -e "Workflow: ${C}./fl.sh setup${N} → ${C}./fl.sh train${N}  (open another tab: ${C}./fl.sh logs${N})"
+        echo -e "PAMAP2 workflow: ${C}./fl.sh setup-pamap2${N} → ${C}./fl.sh train-pamap2${N}"
+        echo -e "MHEALTH workflow: ${C}./fl.sh setup${N} → ${C}./fl.sh train${N}"
         echo ""
         ;;
 esac

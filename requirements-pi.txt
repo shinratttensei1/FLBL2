@@ -1,7 +1,7 @@
 # Raspberry Pi 4 — CPU-only, ARM64
 # Install with: pip install -r requirements-pi.txt
 
-flwr>=1.23.0
+flwr==1.29.0
 torch==2.7.1
 numpy>=1.24.0
 pandas>=2.0.0

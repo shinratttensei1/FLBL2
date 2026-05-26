@@ -27,7 +27,7 @@ BASESCAN   = "https://basescan.org/tx"
 
 # ── 1. Connect to contract ────────────────────────────────────────────────────
 w3 = Web3(Web3.HTTPProvider(os.getenv("BASE_SEPOLIA_RPC_URL")))
-with open("contracts/FLBlockchain_abi.json") as f:
+with open("contracts/FLBL2_abi.json") as f:
     abi = json.load(f)
 contract = w3.eth.contract(
     address=Web3.to_checksum_address(os.getenv("CONTRACT_ADDRESS")), abi=abi)
@@ -64,7 +64,7 @@ for pin in all_pins:
 
 # ── 3. Build run time windows ─────────────────────────────────────────────────
 runs = []   # (utc_start, utc_end, name, variant, pinata_account)
-for run_dir in sorted(glob.glob("outputs/baseline_*") + glob.glob("outputs/optimized_*"),
+for run_dir in sorted(glob.glob("outputs_ucihar/baseline_*") + glob.glob("outputs_ucihar/optimized_*"),
                       key=lambda d: os.path.basename(d).split("_", 1)[1]):
     name    = os.path.basename(run_dir)
     parts   = name.split("_")
@@ -142,7 +142,7 @@ def parse_txs(run_dir: str, run_name: str, variant: str) -> list:
 all_txs = []
 for run_info in runs:
     utc_start, utc_end, name, variant, pinata_acct = run_info
-    run_dir = f"outputs/{name}"
+    run_dir = f"outputs_ucihar/{name}"
     print(f"Parsing {name} ...")
     all_txs.extend(parse_txs(run_dir, name, variant))
 print(f"Total transactions: {len(all_txs)}")
@@ -214,8 +214,8 @@ rows.sort(key=lambda r: r["run"].split("_", 1)[1])
 
 
 # ── 6. Write CSV ──────────────────────────────────────────────────────────────
-os.makedirs("outputs", exist_ok=True)
-out = "outputs/tx_pin_map.csv"
+os.makedirs("outputs_ucihar", exist_ok=True)
+out = "outputs_ucihar/tx_pin_map.csv"
 fields = ["run", "variant", "pinata_account", "fl_round", "block_type",
           "expected_pin", "pin_status", "tx_hash", "basescan_url",
           "ipfs_hash", "pinata_account_actual", "date_pinned"]

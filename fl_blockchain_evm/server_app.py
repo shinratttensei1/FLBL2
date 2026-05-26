@@ -19,6 +19,7 @@ from fl_blockchain_evm.dashboard import state as live_state
 from fl_blockchain_evm.infra.blockchain import EVMBlockchain as FLBlockchain
 from fl_blockchain_evm.strategy.medical_fedavg import MedicalFedAvg
 from fl_blockchain_evm.task import Net, test as test_fn, load_data, SC_NAMES, NUM_CLASSES
+from fl_blockchain_evm.core.constants import DATASET_NAME
 from fl_blockchain_evm.utils import get_device, print_table
 
 G, Y, C, R = '\033[92m', '\033[93m', '\033[96m', '\033[0m'
@@ -31,9 +32,10 @@ G, Y, C, R = '\033[92m', '\033[93m', '\033[96m', '\033[0m'
 #   outputs/optimized_20260422_153011/
 _VARIANT  = os.getenv("EXPERIMENT_VARIANT", "experiment")
 _RUN_TS   = datetime.now().strftime("%Y%m%d_%H%M%S")
-_OUT_DIR  = f"outputs/{_VARIANT}_{_RUN_TS}"
+_OUT_BASE = os.getenv("OUTPUT_BASE_DIR", "outputs_pamap2")
+_OUT_DIR  = f"{_OUT_BASE}/{_VARIANT}_{_RUN_TS}"
 os.makedirs(_OUT_DIR, exist_ok=True)
-os.makedirs("outputs", exist_ok=True)
+os.makedirs(_OUT_BASE, exist_ok=True)
 
 # Keep outputs/latest as a convenience symlink to the most-recent run
 _LATEST = "outputs/latest"
@@ -105,12 +107,6 @@ print(f"[SETUP] Run output dir : {_OUT_DIR}")
 print(f"[SETUP] Variant        : {_VARIANT}")
 print(f"[SETUP] Pinata account : {_PINATA_ACCOUNT}")
 
-SC_LABELS = [
-    'STANDING', 'SITTING', 'LYING', 'WALKING', 'CLIMBING_STAIRS',
-    'WAIST_BENDS', 'ARM_ELEVATION', 'KNEES_BENDING',
-    'CYCLING', 'JOGGING', 'RUNNING', 'JUMP_FRONT_BACK',
-]
-
 # Blockchain is only initialized on server, not on clients
 # This prevents crashes when blockchain credentials are missing
 _blockchain = None
@@ -136,7 +132,7 @@ _round_state: Dict = {
     "round_start_t":  0.0,   # wall-clock time when training results arrived
 }
 
-_EVAL_NUM_PARTITIONS = int(os.getenv("NUM_PARTITIONS", "8"))
+_EVAL_NUM_PARTITIONS = int(os.getenv("NUM_PARTITIONS", "7"))
 
 
 def _plot_cm(cm, rnd, acc, f1):
@@ -144,7 +140,7 @@ def _plot_cm(cm, rnd, acc, f1):
         cm = np.array(cm)
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='.0f', cmap='Blues',
-                xticklabels=SC_LABELS, yticklabels=SC_LABELS)
+                xticklabels=SC_NAMES, yticklabels=SC_NAMES)
     plt.title(f'Confusion Matrix — Round {rnd}\nAcc: {acc:.2%} | F1: {f1:.4f}')
     plt.ylabel('True')
     plt.xlabel('Predicted')
@@ -167,7 +163,7 @@ def global_evaluate(server_round, arrays, config=None):
     m = test_fn(model, testloader, dev)
 
     print(f"\n{Y}{'═'*60}{R}")
-    print(f"{Y}  [ROUND {server_round}] GLOBAL — 12 Activities (MHEALTH){R}")
+    print(f"{Y}  [ROUND {server_round}] GLOBAL — {NUM_CLASSES} Activities ({DATASET_NAME}){R}")
     print(f"{Y}{'═'*60}{R}")
     for k in ["loss", "accuracy", "f1_macro", "f1_weighted",
               "precision_macro", "recall_macro", "specificity_macro", "auc_macro"]:
@@ -412,7 +408,27 @@ app = ServerApp()
 
 @app.main()
 def main(grid: Grid, context: Context):
-    global _EVAL_NUM_PARTITIONS
+    global _EVAL_NUM_PARTITIONS, _VARIANT, _OUT_DIR
+
+    # Resolve experiment variant from run_config (env var not visible inside FAB subprocess)
+    run_variant = str(context.run_config.get("experiment-variant", _VARIANT))
+    if run_variant != _VARIANT:
+        new_out_dir = f"{_OUT_BASE}/{run_variant}_{_RUN_TS}"
+        try:
+            if os.path.exists(_OUT_DIR) and not os.path.exists(new_out_dir):
+                os.rename(_OUT_DIR, new_out_dir)
+            else:
+                os.makedirs(new_out_dir, exist_ok=True)
+            _VARIANT = run_variant
+            _OUT_DIR = new_out_dir
+            if os.path.islink(_LATEST):
+                os.unlink(_LATEST)
+            os.symlink(os.path.abspath(_OUT_DIR), _LATEST)
+            _EXPERIMENT_CONFIG["variant"] = _VARIANT
+            with open(f"{_OUT_DIR}/experiment_config.json", "w") as _f:
+                json.dump(_EXPERIMENT_CONFIG, _f, indent=2)
+        except Exception as _e:
+            print(f"[SETUP] Warning: could not update output dir for variant {run_variant}: {_e}")
 
     # run_config from pyproject.toml; env vars as fallback for flower-server-app direct use
     lr         = float(context.run_config.get("lr",               os.getenv("LR",           "0.002")))
@@ -421,6 +437,10 @@ def main(grid: Grid, context: Context):
     _EVAL_NUM_PARTITIONS = int(context.run_config.get(
         "num-partitions", os.getenv("NUM_PARTITIONS", str(_EVAL_NUM_PARTITIONS))
     ))
+
+    # Push blockchain-optimized into os.environ so EVMBlockchain.__init__ picks it up
+    bc_opt = int(context.run_config.get("blockchain-optimized", 0))
+    os.environ['BLOCKCHAIN_OPTIMIZED'] = str(bc_opt)
 
     if os.path.exists(f"{_OUT_DIR}/results.json"):
         os.remove(f"{_OUT_DIR}/results.json")
@@ -441,7 +461,7 @@ def main(grid: Grid, context: Context):
 
     ipfs_status = "enabled" if (bc is not None and bc.ipfs_enabled) else "disabled"
     print(f"\n{C}{'═'*60}")
-    print(f"  12 Activities (MHEALTH): {', '.join(SC_NAMES)}")
+    print(f"  {NUM_CLASSES} Activities ({DATASET_NAME}): {', '.join(SC_NAMES)}")
     print(f"  Rounds: {num_rounds} | LR: {lr} | Device: {get_device()}")
     print(f"  Eval partitioning: {_EVAL_NUM_PARTITIONS} partitions")
     print(f"  Blockchain: 3 tx per round (LOCAL + VOTE + GLOBAL)")

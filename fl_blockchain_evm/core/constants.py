@@ -1,41 +1,35 @@
-"""Shared constants for the FL-Blockchain-EVM project (MHEALTH).
+"""Shared constants — selected at import time via FL_DATASET env var.
 
-Activity class names and metadata for Human Activity Recognition
-used across the model, data loading, training, and evaluation modules.
-
-Dataset: MHEALTH (Mobile Health) — Banos et al., 2014
-- 10 subjects, 12 physical activity classes
-- 23 sensor channels (chest acc, ECG x2, left-ankle acc/gyro/mag,
-  right-arm acc/gyro/mag)
-- Labels 1-12 (0 = null class, excluded)
+  FL_DATASET=ucihar  (default) — UCI HAR, 6 classes, 9 channels, 128-sample windows
+  FL_DATASET=pamap2             — PAMAP2, 12 classes, 27 channels, 512-sample windows
 """
 
+import os
 from typing import List
 
-# ── Activity class names (MHEALTH) ───────────────────────────
+_DATASET = os.getenv("FL_DATASET", "ucihar")
 
-ACTIVITY_NAMES: List[str] = [
-    "STANDING",
-    "SITTING",
-    "LYING",
-    "WALKING",
-    "CLIMBING_STAIRS",
-    "WAIST_BENDS",
-    "ARM_ELEVATION",
-    "KNEES_BENDING",
-    "CYCLING",
-    "JOGGING",
-    "RUNNING",
-    "JUMP_FRONT_BACK",
-]
+if _DATASET == "pamap2":
+    DATASET_NAME: str = "PAMAP2"
+    ACTIVITY_NAMES: List[str] = [
+        "LYING", "SITTING", "STANDING", "WALKING", "RUNNING", "CYCLING",
+        "NORDIC_WALKING", "ASCENDING_STAIRS", "DESCENDING_STAIRS",
+        "VACUUM_CLEANING", "IRONING", "ROPE_JUMPING",
+    ]
+    NUM_CLASSES  = 12
+    NUM_CHANNELS = 27
+    WINDOW_SIZE  = 512
+    WINDOW_STEP  = 256
+else:
+    # UCI HAR (default)
+    DATASET_NAME: str = "UCI HAR"
+    ACTIVITY_NAMES: List[str] = [
+        "WALKING", "WALKING_UPSTAIRS", "WALKING_DOWNSTAIRS",
+        "SITTING", "STANDING", "LAYING",
+    ]
+    NUM_CLASSES  = 6
+    NUM_CHANNELS = 9
+    WINDOW_SIZE  = 128
+    WINDOW_STEP  = 64
 
-SC_NAMES: List[str] = ACTIVITY_NAMES  # alias used throughout codebase
-NUM_CLASSES = 12
-
-# ── Sensor channel count ──────────────────────────────────────
-# 23 sensor columns per row (columns 1-23); column 24 is the label
-NUM_CHANNELS = 23
-
-# ── Window / stride for sliding-window segmentation ──────────
-WINDOW_SIZE = 256   # samples at 50 Hz ≈ 5.12 s
-WINDOW_STEP = 128   # 50 % overlap
+SC_NAMES: List[str] = ACTIVITY_NAMES
